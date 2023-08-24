@@ -18,6 +18,7 @@ dependencies:
     path: ../flutter_core
   in_app_purchase_android: ^0.3.0+10
   get_it: ^7.6.0
+  encrypt: ^5.0.1
 
 dev_dependencies:
   flutter_test:
