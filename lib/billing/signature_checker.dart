@@ -7,12 +7,12 @@ abstract class SignatureChecker {
   List<String> get acceptSignature;
 
   SignatureChecker(this.packageInfo) {
-    for (var sign in acceptSignature) {
-      final decrypted = decrypt(sign);
-      final encrypted = encrypt(decrypted);
-      print("encrypted: $encrypted");
-      print("decrypted: $decrypted");
-    }
+    // for (var sign in acceptSignature) {
+    //   final decrypted = decrypt(sign);
+    //   final encrypted = encrypt(decrypted);
+    //   print("encrypted: $encrypted");
+    //   print("decrypted: $decrypted");
+    // }
   }
 
   bool validSignature() =>
