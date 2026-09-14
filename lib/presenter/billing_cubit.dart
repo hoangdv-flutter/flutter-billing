@@ -3,17 +3,15 @@ import 'dart:async';
 import 'package:flutter_billing/billing/billing_repository.dart';
 import 'package:flutter_billing/billing/product_item.dart';
 import 'package:flutter_billing/billing/purchase_response.dart';
-import 'package:flutter_core/component/view/list/my_list_view.dart';
-import 'package:flutter_core/ext/di.dart';
-import 'package:flutter_core/ext/stream.dart';
-import 'package:flutter_core/presenter/base_cubit.dart';
+import 'package:flutter_core/core.dart';
 import 'package:rxdart/rxdart.dart';
 
 class BillingCubit extends BaseCubit<void> {
   BillingCubit() : super(null) {
     _productSubs = billingRepository.productsStream.listen((products) {
       _productsBS.addSafety(
-          ListItemUpdate(data: products, action: ItemUpdateAction.replace));
+        ListItemUpdate(data: products, action: ItemUpdateAction.replace),
+      );
     });
   }
 
@@ -32,9 +30,16 @@ class BillingCubit extends BaseCubit<void> {
     billingRepository.queryAllProducts();
   }
 
+  /// Hỏi store và **chờ** kết quả — dùng cho màn có trạng thái lỗi/thử lại.
+  Future<List<ProductItem>> loadProducts({bool force = false}) =>
+      billingRepository.loadProducts(force: force);
+
   void buyProduct(ProductItem productItem) {
     billingRepository.buyProduct(productItem);
   }
+
+  /// Nút "Khôi phục giao dịch" — App Store bắt buộc app bán subscription phải có.
+  Future<void> restorePurchases() => billingRepository.restorePurchases();
 
   late final billingRepository = appInject<BillingRepository>();
 

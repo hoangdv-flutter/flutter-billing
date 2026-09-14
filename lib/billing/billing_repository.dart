@@ -1,20 +1,28 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math';
 
 import 'package:flutter_billing/billing/billing_helper.dart';
 import 'package:flutter_billing/billing/product_item.dart';
 import 'package:flutter_billing/billing/purchase_response.dart';
 import 'package:flutter_billing/billing/signature_checker.dart';
-import 'package:flutter_core/data/executable.dart';
-import 'package:flutter_core/data/shared/premium_holder.dart';
-import 'package:flutter_core/ext/di.dart';
-import 'package:flutter_core/ext/list.dart';
-import 'package:flutter_core/ext/stream.dart';
+// flutter_core gom mọi thứ vào một thư viện `core.dart` (các file con là
+// `part of`), nên import lẻ từng file sẽ không biên dịch được.
+import 'package:flutter_core/core.dart';
+import 'package:get_it/get_it.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:in_app_purchase_android/in_app_purchase_android.dart';
 import 'package:injectable/injectable.dart';
 import 'package:rxdart/rxdart.dart';
+
+/// Store không dùng được (máy tắt mua hàng, chưa đăng nhập store, sandbox lỗi).
+class BillingUnavailable implements Exception {
+  const BillingUnavailable([this.reason]);
+
+  final String? reason;
+
+  @override
+  String toString() => 'BillingUnavailable(${reason ?? 'store not available'})';
+}
 
 abstract class BillingRepository extends Executable {
   ValueStream<List<ProductItem>> get productsStream;
@@ -23,7 +31,19 @@ abstract class BillingRepository extends Executable {
 
   void queryAllProducts();
 
+  /// Bản **chờ được** của [queryAllProducts] — trả về danh sách sau khi hỏi
+  /// store xong, ném [BillingUnavailable] nếu store không dùng được.
+  ///
+  /// Có mặt từ 0.1.0: [queryAllProducts] chạy qua `executeSingleTask`, mà hàm đó
+  /// **nuốt mọi exception**, nên bên gọi không có cách nào phân biệt "store trả
+  /// về 0 gói" với "gọi store thất bại". Màn paywall cần phân biệt để chọn giữa
+  /// trạng thái rỗng và trạng thái lỗi-có-nút-thử-lại.
+  Future<List<ProductItem>> loadProducts({bool force = false});
+
   void buyProduct(ProductItem productItem);
+
+  /// Khôi phục giao dịch cũ (bắt buộc phải có nút này theo luật App Store).
+  Future<void> restorePurchases();
 }
 
 @Singleton(as: BillingRepository)
@@ -55,6 +75,13 @@ class BillingRepository_Impl extends BillingRepository {
 
   StreamSubscription? _purchaseStreamSubscription;
 
+  /// Chỉ xoá quyền Premium khi danh sách rỗng đến **sau một lượt khôi phục**.
+  ///
+  /// `purchaseStream` phát `[]` để báo "khôi phục xong, không có giao dịch nào".
+  /// Bản 0.0.1 coi mọi lượt `[]` là mất quyền — nghĩa là một lượt phát rỗng lạc
+  /// nhịp cũng đủ thổi bay Premium của người đã trả tiền.
+  bool _restoreInFlight = false;
+
   @override
   @disposeMethod
   Future<void> dispose() async {
@@ -64,101 +91,163 @@ class BillingRepository_Impl extends BillingRepository {
   }
 
   void updateProductItem(List<ProductItem> productItems) {
-    _productsItem.clear();
-    _productsItem.addAll(productItems);
+    _productsItem
+      ..clear()
+      ..addAll(productItems);
     _productItemsBS.addSafety(productItems);
   }
 
+  /// Chữ ký chỉ kiểm tra khi app **có đăng ký** [SignatureChecker].
+  ///
+  /// Bản 0.0.1 gọi thẳng `appInject<SignatureChecker>()`: app nào quên đăng ký
+  /// là `GetIt` ném ngay trong listener của `purchaseStream` — lỗi rơi vào chỗ
+  /// không ai bắt, và người dùng thấy màn thanh toán treo im.
+  bool _validSignature() {
+    final checker = GetIt.I.isRegistered<SignatureChecker>()
+        ? GetIt.I<SignatureChecker>()
+        : null;
+    return checker?.validSignature() ?? true;
+  }
+
   void _listenPurchaseUpdate() {
-    _purchaseStreamSubscription =
-        InAppPurchase.instance.purchaseStream.listen((purchaseDetails) async {
+    _purchaseStreamSubscription = InAppPurchase.instance.purchaseStream.listen((
+      purchaseDetails,
+    ) async {
       if (purchaseDetails.isEmpty) {
-        _activePremium(null);
+        if (_restoreInFlight) {
+          _restoreInFlight = false;
+          _activePremium(null);
+        }
         return;
       }
-      for (var purchase in purchaseDetails) {
-        if (purchase.status == PurchaseStatus.pending) {
-          _purchaseResponseSC
-              .addSafety(PurchaseResponse.error(purchase.productID));
-        } else if (purchase.status == PurchaseStatus.error ||
-            !appInject<SignatureChecker>().validSignature()) {
-          _purchaseResponseSC
-              .addSafety(PurchaseResponse.error(purchase.productID));
-        } else if (purchase.status == PurchaseStatus.purchased ||
-            purchase.status == PurchaseStatus.restored) {
-          _purchaseResponseSC
-              .addSafety(PurchaseResponse.purchased(purchase.productID));
-          _activePremium(purchase);
+      _restoreInFlight = false;
+      for (final purchase in purchaseDetails) {
+        switch (purchase.status) {
+          // Chờ duyệt (Ask to Buy của trẻ em, thẻ cần xác thực thêm). KHÔNG
+          // phải lỗi — bản 0.0.1 báo `error` nên UI đóng màn và người dùng tưởng
+          // hỏng, rồi vài phút sau giao dịch về thì không còn chỗ nào hiện ra.
+          case PurchaseStatus.pending:
+            _purchaseResponseSC.addSafety(
+              PurchaseResponse.pending(purchase.productID),
+            );
+          // Người dùng bấm huỷ. Bản 0.0.1 không có nhánh này nên rơi tọt xuống
+          // đáy vòng lặp: UI kẹt ở spinner vĩnh viễn.
+          case PurchaseStatus.canceled:
+            _purchaseResponseSC.addSafety(
+              PurchaseResponse.cancelled(purchase.productID),
+            );
+          case PurchaseStatus.error:
+            _purchaseResponseSC.addSafety(
+              PurchaseResponse.error(
+                purchase.productID,
+                errorCode: purchase.error?.code,
+                errorMessage: purchase.error?.message,
+              ),
+            );
+          case PurchaseStatus.purchased:
+          case PurchaseStatus.restored:
+            if (!_validSignature()) {
+              _purchaseResponseSC.addSafety(
+                PurchaseResponse.error(
+                  purchase.productID,
+                  errorCode: 'invalid_signature',
+                ),
+              );
+            } else {
+              _purchaseResponseSC.addSafety(
+                PurchaseResponse.purchased(purchase.productID),
+              );
+              _activePremium(purchase);
+            }
         }
 
+        // Giao dịch chưa "finish" thì StoreKit phát lại nó mỗi lần mở app, và
+        // Apple từ chối bản build để nguyên như vậy — nên vẫn phải đóng cả với
+        // trường hợp lỗi/huỷ.
         if (purchase.pendingCompletePurchase) {
           await InAppPurchase.instance.completePurchase(purchase);
         }
-        // _consumePurchase(purchase);
       }
     });
   }
 
   @override
   void queryAllProducts() {
-    executeSingleTask(() async {
-      if (_productsItem.isNotEmpty) return;
-      final available = await InAppPurchase.instance.isAvailable();
-      if (!available) {
-        updateProductItem([]);
-        return;
-      }
-      final ProductDetailsResponse productDetailsResponse = await InAppPurchase
-          .instance
-          .queryProductDetails(billingRequestProvider.allProducts);
-      if (productDetailsResponse.notFoundIDs.isNotEmpty) {
-        updateProductItem([]);
-        return;
-      }
-      _mappingProductDetail(productDetailsResponse.productDetails);
-      await InAppPurchase.instance.restorePurchases();
-    });
+    executeSingleTask(() => loadProducts());
   }
 
-  void _mappingProductDetail(List<ProductDetails> productDetails) {
+  @override
+  Future<List<ProductItem>> loadProducts({bool force = false}) async {
+    if (!force && _productsItem.isNotEmpty) return List.of(_productsItem);
+
+    if (!await InAppPurchase.instance.isAvailable()) {
+      updateProductItem([]);
+      throw const BillingUnavailable('in-app purchase disabled on this device');
+    }
+
+    final response = await InAppPurchase.instance.queryProductDetails(
+      billingRequestProvider.allProducts,
+    );
+    if (response.error != null) {
+      updateProductItem([]);
+      throw BillingUnavailable(response.error!.message);
+    }
+
+    // Chỉ **một** id chưa duyệt xong ở App Store Connect là bản 0.0.1 ném đi
+    // sạch catalog và màn paywall trắng trơn. Giữ những gói store trả về được;
+    // `notFoundIDs` là chuyện cấu hình, không phải lỗi phiên mua.
+    final items = _mapProductDetail(response.productDetails);
+    updateProductItem(items);
+
+    // Đọc lại quyền từ giao dịch cũ. Không `await` để trả gói về cho UI ngay —
+    // kết quả khôi phục đi đường `purchaseStream`.
+    unawaited(restorePurchases());
+    return items;
+  }
+
+  List<ProductItem> _mapProductDetail(List<ProductDetails> productDetails) {
     final productItems = <ProductItem>[];
-    for (var product in productDetails) {
+    for (final product in productDetails) {
       final billingRequest =
           billingRequestProvider.productRequestMap[product.id];
       if (billingRequest == null) continue;
-      final item =
-          ProductItem(label: billingRequest.label, productDetail: product);
-      item.saleOff = billingRequest.saleOff;
-      productItems.add(item);
+      productItems.add(
+        ProductItem(label: billingRequest.label, productDetail: product)
+          ..saleOff = billingRequest.saleOff,
+      );
     }
     productItems.sort(
-      (a, b) => a.productDetail.rawPrice > b.productDetail.rawPrice ? 1 : -1,
+      (a, b) => a.productDetail.rawPrice.compareTo(b.productDetail.rawPrice),
     );
-    updateProductItem(productItems);
+    return productItems;
   }
 
   @override
   Future<void> buyProduct(ProductItem productItem) async {
-    final purchaseParams =
-        PurchaseParam(productDetails: productItem.productDetail);
-    await InAppPurchase.instance
-        .buyNonConsumable(purchaseParam: purchaseParams);
-    // if (productItem.productDetail.id == BillingHelper.productLifetime) {
-    //   await InAppPurchase.instance
-    //       .buyConsumable(purchaseParam: purchaseParams, autoConsume: false);
-    // } else {
-    //   await InAppPurchase.instance
-    //       .buyNonConsumable(purchaseParam: purchaseParams);
-    // }
+    final purchaseParams = PurchaseParam(
+      productDetails: productItem.productDetail,
+    );
+    await InAppPurchase.instance.buyNonConsumable(purchaseParam: purchaseParams);
   }
 
-  Future<void> _consumePurchase(PurchaseDetails purchaseDetails) async {
-    if (Platform.isAndroid) {
-      final InAppPurchaseAndroidPlatformAddition androidAddition = InAppPurchase
-          .instance
-          .getPlatformAddition<InAppPurchaseAndroidPlatformAddition>();
-      await androidAddition.consumePurchase(purchaseDetails);
+  @override
+  Future<void> restorePurchases() async {
+    _restoreInFlight = true;
+    try {
+      await InAppPurchase.instance.restorePurchases();
+    } catch (_) {
+      _restoreInFlight = false;
+      rethrow;
     }
+  }
+
+  /// Chỉ Android mới cần: gói mua-một-lần đăng ký kiểu `consumable` phải được
+  /// "tiêu thụ" thì Play mới cho mua lại. Giữ lại cho app nào dùng tới.
+  Future<void> consumePurchase(PurchaseDetails purchaseDetails) async {
+    if (!Platform.isAndroid) return;
+    final androidAddition = InAppPurchase.instance
+        .getPlatformAddition<InAppPurchaseAndroidPlatformAddition>();
+    await androidAddition.consumePurchase(purchaseDetails);
   }
 
   void _activePremium(PurchaseDetails? purchase) {
@@ -167,7 +256,8 @@ class BillingRepository_Impl extends BillingRepository {
       premiumHolder.premiumDay = 0;
       return;
     }
-    final startDay = int.parse(purchase.transactionDate ?? '0');
+    final startDay = int.tryParse(purchase.transactionDate ?? '') ??
+        DateTime.now().millisecondsSinceEpoch;
     final billingRequest =
         billingRequestProvider.productRequestMap[purchase.productID];
     if (billingRequest == null) return;

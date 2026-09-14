@@ -28,3 +28,7 @@ migrate_working_dir/
 .dart_tool/
 .packages
 build/
+
+# sinh ra khi chạy `flutter pub get` ngay trong package
+.flutter-plugins-dependencies
+pubspec.lock
