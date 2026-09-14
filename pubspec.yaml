@@ -1,6 +1,6 @@
 name: flutter_billing
 description: Lớp mua hàng trong app (IAP) dùng chung — bọc `in_app_purchase`.
-version: 0.1.0
+version: 0.2.0
 publish_to: 'none' # có path dependency (flutter_core) nên không đẩy pub.dev
 homepage:
 

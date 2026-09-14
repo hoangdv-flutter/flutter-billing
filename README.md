@@ -31,7 +31,30 @@ dependencies:
 2. **(Tuỳ chọn, chỉ Android)** chống repack: kế thừa `SignatureChecker`, khai
    `acceptSignature`, đăng ký vào GetIt. Không đăng ký thì bước này được bỏ qua.
 
-3. Dùng `BillingCubit` (hoặc `appInject<BillingRepository>()` trực tiếp):
+3. **Xác minh ở server** (bỏ qua nếu app không có BE): implement
+   `PurchaseVerifier` và đăng ký vào GetIt. `BillingRepository` chờ nó trả lời
+   trước khi công nhận quyền:
+
+   ```dart
+   class MyVerifier implements PurchaseVerifier {
+     @override
+     Future<VerifyResult> verify(PurchaseDetails p) async {
+       try {
+         await api.post('/billing/verify', data: {
+           'platform': 'ios',
+           'jws': p.verificationData.serverVerificationData,
+         });
+         return VerifyResult.granted;
+       } on ServerSaysNo {
+         return VerifyResult.rejected;    // chữ ký sai / product lạ — thử lại vô ích
+       } catch (_) {
+         return VerifyResult.unavailable; // mất mạng — giữ giao dịch, thử lại sau
+       }
+     }
+   }
+   ```
+
+4. Dùng `BillingCubit` (hoặc `appInject<BillingRepository>()` trực tiếp):
 
    ```dart
    final products = await cubit.loadProducts();   // chờ được, ném BillingUnavailable
@@ -59,11 +82,15 @@ hỏng". Cần phân biệt thì dùng `loadProducts()`.
   thuộc tính riêng của Android, trên iOS luôn rỗng. Xem doc của lớp đó.
 - **Phải `completePurchase`** mọi giao dịch (kể cả lỗi/huỷ), nếu không StoreKit
   phát lại nó mỗi lần mở app và Apple từ chối bản build. Repository đã làm sẵn.
-- **Xác minh ở server**: `SK2PurchaseDetails.serverVerificationData` là chuỗi JWS
-  của Apple, gửi lên BE mà verify. Đừng tin mỗi việc store báo "purchased".
+- **Xác minh ở server**: `PurchaseResponse.serverVerificationData` là chuỗi JWS
+  Apple ký, gửi nguyên văn lên BE mà verify. Đừng tin mỗi việc store báo
+  "purchased", và đừng parse JWS ở client rồi tin nội dung — giá trị của nó nằm
+  đúng ở chỗ chỉ server mới kiểm được chữ ký.
 
 ## Lịch sử
 
+- **0.2.0** — `PurchaseResponse` lộ `serverVerificationData` (JWS) + hook
+  `PurchaseVerifier` để xác minh với server **trước khi** đóng giao dịch.
 - **0.1.0** — bỏ vỏ plugin native (ghim AGP 7.3 / compileSdk 31, làm vỡ build
   AGP 9); `in_app_purchase` 3.1.11 → 3.3.0; khai báo các dependency đang dùng
   chui; sửa loạt lỗi làm hỏng luồng mua trên iOS (xem `CHANGELOG.md`).

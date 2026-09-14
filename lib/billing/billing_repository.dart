@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter_billing/billing/billing_helper.dart';
 import 'package:flutter_billing/billing/product_item.dart';
 import 'package:flutter_billing/billing/purchase_response.dart';
+import 'package:flutter_billing/billing/purchase_verifier.dart';
 import 'package:flutter_billing/billing/signature_checker.dart';
 // flutter_core gom mọi thứ vào một thư viện `core.dart` (các file con là
 // `part of`), nên import lẻ từng file sẽ không biên dịch được.
@@ -122,53 +123,102 @@ class BillingRepository_Impl extends BillingRepository {
       }
       _restoreInFlight = false;
       for (final purchase in purchaseDetails) {
-        switch (purchase.status) {
-          // Chờ duyệt (Ask to Buy của trẻ em, thẻ cần xác thực thêm). KHÔNG
-          // phải lỗi — bản 0.0.1 báo `error` nên UI đóng màn và người dùng tưởng
-          // hỏng, rồi vài phút sau giao dịch về thì không còn chỗ nào hiện ra.
-          case PurchaseStatus.pending:
-            _purchaseResponseSC.addSafety(
-              PurchaseResponse.pending(purchase.productID),
-            );
-          // Người dùng bấm huỷ. Bản 0.0.1 không có nhánh này nên rơi tọt xuống
-          // đáy vòng lặp: UI kẹt ở spinner vĩnh viễn.
-          case PurchaseStatus.canceled:
-            _purchaseResponseSC.addSafety(
-              PurchaseResponse.cancelled(purchase.productID),
-            );
-          case PurchaseStatus.error:
-            _purchaseResponseSC.addSafety(
-              PurchaseResponse.error(
-                purchase.productID,
-                errorCode: purchase.error?.code,
-                errorMessage: purchase.error?.message,
-              ),
-            );
-          case PurchaseStatus.purchased:
-          case PurchaseStatus.restored:
-            if (!_validSignature()) {
-              _purchaseResponseSC.addSafety(
-                PurchaseResponse.error(
-                  purchase.productID,
-                  errorCode: 'invalid_signature',
-                ),
-              );
-            } else {
-              _purchaseResponseSC.addSafety(
-                PurchaseResponse.purchased(purchase.productID),
-              );
-              _activePremium(purchase);
-            }
-        }
-
-        // Giao dịch chưa "finish" thì StoreKit phát lại nó mỗi lần mở app, và
-        // Apple từ chối bản build để nguyên như vậy — nên vẫn phải đóng cả với
-        // trường hợp lỗi/huỷ.
-        if (purchase.pendingCompletePurchase) {
-          await InAppPurchase.instance.completePurchase(purchase);
-        }
+        await _handleOne(purchase);
       }
     });
+  }
+
+  Future<void> _handleOne(PurchaseDetails purchase) async {
+    switch (purchase.status) {
+      // Chờ duyệt (Ask to Buy của trẻ em, thẻ cần xác thực thêm). KHÔNG phải
+      // lỗi — bản 0.0.1 báo `error` nên UI đóng màn và người dùng tưởng hỏng,
+      // rồi vài phút sau giao dịch về thì không còn chỗ nào hiện ra.
+      //
+      // Đang chờ thì `pendingCompletePurchase` là `false`; không đóng gì cả.
+      case PurchaseStatus.pending:
+        _emit(PurchaseResponse.pending(purchase.productID, details: purchase));
+        return;
+
+      // Người dùng bấm huỷ. Bản 0.0.1 không có nhánh này nên rơi tọt xuống đáy
+      // vòng lặp: UI kẹt ở spinner vĩnh viễn.
+      case PurchaseStatus.canceled:
+        _emit(PurchaseResponse.cancelled(purchase.productID, details: purchase));
+      case PurchaseStatus.error:
+        _emit(
+          PurchaseResponse.error(
+            purchase.productID,
+            details: purchase,
+            errorCode: purchase.error?.code,
+            errorMessage: purchase.error?.message,
+          ),
+        );
+      case PurchaseStatus.purchased:
+      case PurchaseStatus.restored:
+        if (!_validSignature()) {
+          _emit(
+            PurchaseResponse.error(
+              purchase.productID,
+              details: purchase,
+              errorCode: 'invalid_signature',
+            ),
+          );
+          break;
+        }
+        switch (await _verifyWithServer(purchase)) {
+          case VerifyResult.granted:
+            _emit(
+              PurchaseResponse.purchased(purchase.productID, details: purchase),
+            );
+            _activePremium(purchase);
+          case VerifyResult.rejected:
+            // Server nói KHÔNG và sẽ mãi nói không ⇒ đóng giao dịch (rơi xuống
+            // dưới). Giữ lại chỉ để store phát lại một giao dịch vô dụng mỗi lần
+            // mở app.
+            _emit(
+              PurchaseResponse.error(
+                purchase.productID,
+                details: purchase,
+                errorCode: 'server_rejected',
+              ),
+            );
+          case VerifyResult.unavailable:
+            // **Chưa biết** ⇒ KHÔNG đóng: store giữ giao dịch lại và phát lại ở
+            // lần mở app sau, lúc đó verify lại. Đóng bây giờ là vứt mất cơ hội
+            // đó và người vừa trả tiền phải tự bấm "Khôi phục".
+            _emit(
+              PurchaseResponse.error(
+                purchase.productID,
+                details: purchase,
+                errorCode: 'verify_unavailable',
+              ),
+            );
+            return;
+        }
+    }
+
+    // Giao dịch chưa "finish" thì StoreKit phát lại nó mỗi lần mở app, và Apple
+    // từ chối bản build để nguyên như vậy — nên vẫn phải đóng cả với trường hợp
+    // lỗi/huỷ/bị server từ chối.
+    if (purchase.pendingCompletePurchase) {
+      await InAppPurchase.instance.completePurchase(purchase);
+    }
+  }
+
+  void _emit(PurchaseResponse response) =>
+      _purchaseResponseSC.addSafety(response);
+
+  /// Hỏi server của app xem giao dịch này có thật không.
+  ///
+  /// Không đăng ký [PurchaseVerifier] ⇒ tin store luôn (app không có server).
+  /// Verifier ném thì coi như **chưa biết**: nó vi phạm hợp đồng của mình, và
+  /// đoán "hợp lệ" ở đây là phát Premium theo lời của thiết bị.
+  Future<VerifyResult> _verifyWithServer(PurchaseDetails purchase) async {
+    if (!GetIt.I.isRegistered<PurchaseVerifier>()) return VerifyResult.granted;
+    try {
+      return await GetIt.I<PurchaseVerifier>().verify(purchase);
+    } catch (_) {
+      return VerifyResult.unavailable;
+    }
   }
 
   @override
