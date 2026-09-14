@@ -41,7 +41,9 @@ abstract class BillingRepository extends Executable {
   /// trạng thái rỗng và trạng thái lỗi-có-nút-thử-lại.
   Future<List<ProductItem>> loadProducts({bool force = false});
 
-  void buyProduct(ProductItem productItem);
+  /// Mở luồng thanh toán. `Future` hoàn tất khi store **nhận** yêu cầu, KHÔNG
+  /// phải khi mua xong — kết quả về qua [purchaseResponseStream].
+  Future<void> buyProduct(ProductItem productItem);
 
   /// Khôi phục giao dịch cũ (bắt buộc phải có nút này theo luật App Store).
   Future<void> restorePurchases();
