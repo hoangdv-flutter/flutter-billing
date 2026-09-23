@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import 'package:flutter_billing/billing/billing_helper.dart';
 import 'package:flutter_billing/billing/product_item.dart';
 import 'package:flutter_billing/billing/purchase_response.dart';
@@ -225,7 +227,17 @@ class BillingRepository_Impl extends BillingRepository {
 
   @override
   void queryAllProducts() {
-    executeSingleTask(() => loadProducts());
+    // `executeSingleTask` NUỐT mọi exception (xem doc của loadProducts). Bắt lại
+    // ở đây chỉ để log — không có dòng này thì lỗi hỏi store lúc khởi động biến
+    // mất không dấu vết.
+    executeSingleTask(() async {
+      try {
+        return await loadProducts();
+      } catch (e) {
+        debugPrint('[flutter_billing] queryAllProducts thất bại: $e');
+        rethrow;
+      }
+    });
   }
 
   @override
@@ -234,6 +246,10 @@ class BillingRepository_Impl extends BillingRepository {
 
     if (!await InAppPurchase.instance.isAvailable()) {
       updateProductItem([]);
+      // Máy tắt mua hàng (Screen Time / MDM), hoặc chưa đăng nhập tài khoản
+      // store. Phải log: không có nó thì cả luồng im lặng tuyệt đối và không ai
+      // biết phân biệt với "chưa ai mở màn paywall".
+      debugPrint('[flutter_billing] InAppPurchase.isAvailable() = false');
       throw const BillingUnavailable('in-app purchase disabled on this device');
     }
 
@@ -242,13 +258,42 @@ class BillingRepository_Impl extends BillingRepository {
     );
     if (response.error != null) {
       updateProductItem([]);
+      // In cả danh sách id đã hỏi: câu hỏi đầu tiên khi store trả rỗng luôn là
+      // "nó hỏi id nào", và không có dòng này thì phải đi đọc code mới biết.
+      //
+      // `storekit_no_response` của in_app_purchase_storekit KHÔNG phải lỗi mạng:
+      // plugin ném nó khi `Product.products(for:)` trả về danh sách RỖNG, tức là
+      // App Store không khớp id nào. Gần như luôn là cấu hình phía cửa hàng —
+      // hợp đồng Paid Applications chưa ký, gói còn "Missing Metadata", hoặc id
+      // gõ khác.
+      debugPrint(
+        '[flutter_billing] queryProductDetails lỗi: '
+        '${response.error!.code} ${response.error!.message} '
+        '(${response.error!.details}) — đã hỏi: '
+        '${billingRequestProvider.allProducts.join(", ")}',
+      );
       throw BillingUnavailable(response.error!.message);
     }
 
     // Chỉ **một** id chưa duyệt xong ở App Store Connect là bản 0.0.1 ném đi
     // sạch catalog và màn paywall trắng trơn. Giữ những gói store trả về được;
     // `notFoundIDs` là chuyện cấu hình, không phải lỗi phiên mua.
+    //
+    // Nhưng PHẢI log: id không khớp là lỗi cấu hình im lặng nhất của cả luồng
+    // này — thẻ gói biến mất khỏi màn và không có gì trên UI nói vì sao.
+    if (response.notFoundIDs.isNotEmpty) {
+      debugPrint(
+        '[flutter_billing] store KHÔNG có ${response.notFoundIDs.length} id: '
+        '${response.notFoundIDs.join(", ")} — kiểm tra product id ở App Store '
+        'Connect / Play Console, trạng thái duyệt, và hợp đồng Paid Apps.',
+      );
+    }
     final items = _mapProductDetail(response.productDetails);
+    debugPrint(
+      '[flutter_billing] store trả ${items.length}/'
+      '${billingRequestProvider.allProducts.length} gói: '
+      '${items.map((e) => "${e.productDetail.id}=${e.productDetail.price}").join(" | ")}',
+    );
     updateProductItem(items);
 
     // Đọc lại quyền từ giao dịch cũ. Không `await` để trả gói về cho UI ngay —
