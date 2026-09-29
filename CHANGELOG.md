@@ -1,3 +1,10 @@
+## 0.2.1
+
+- `buyProduct(item, {appAccountToken})`: truyền mã tài khoản của app (UUID) vào
+  lượt mua. StoreKit 2 ghi nó vào giao dịch đã ký, server đọc ra được **ai trả
+  tiền** — chặn một Apple ID khôi phục Premium cho nhiều tài khoản. Không truyền
+  thì giữ nguyên hành vi 0.2.0.
+
 ## 0.2.0
 
 **Mở đường xác minh ở server.** Bản 0.1.0 công nhận quyền theo lời của *thiết

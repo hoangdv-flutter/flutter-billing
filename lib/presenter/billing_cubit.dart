@@ -34,8 +34,8 @@ class BillingCubit extends BaseCubit<void> {
   Future<List<ProductItem>> loadProducts({bool force = false}) =>
       billingRepository.loadProducts(force: force);
 
-  Future<void> buyProduct(ProductItem productItem) =>
-      billingRepository.buyProduct(productItem);
+  Future<void> buyProduct(ProductItem productItem, {String? appAccountToken}) =>
+      billingRepository.buyProduct(productItem, appAccountToken: appAccountToken);
 
   /// Nút "Khôi phục giao dịch" — App Store bắt buộc app bán subscription phải có.
   Future<void> restorePurchases() => billingRepository.restorePurchases();

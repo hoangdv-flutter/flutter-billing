@@ -45,7 +45,12 @@ abstract class BillingRepository extends Executable {
 
   /// Mở luồng thanh toán. `Future` hoàn tất khi store **nhận** yêu cầu, KHÔNG
   /// phải khi mua xong — kết quả về qua [purchaseResponseStream].
-  Future<void> buyProduct(ProductItem productItem);
+  ///
+  /// [appAccountToken] (từ 0.2.1): mã **tài khoản của app** đang mua, phải là
+  /// UUID. StoreKit 2 ghi nó vào giao dịch đã ký (`appAccountToken` trong JWS),
+  /// nên server biết chắc ai trả tiền kể cả khi về sau tài khoản khác khôi phục
+  /// giao dịch đó. Không phải UUID thì StoreKit bỏ qua.
+  Future<void> buyProduct(ProductItem productItem, {String? appAccountToken});
 
   /// Khôi phục giao dịch cũ (bắt buộc phải có nút này theo luật App Store).
   Future<void> restorePurchases();
@@ -320,9 +325,15 @@ class BillingRepository_Impl extends BillingRepository {
   }
 
   @override
-  Future<void> buyProduct(ProductItem productItem) async {
+  Future<void> buyProduct(
+    ProductItem productItem, {
+    String? appAccountToken,
+  }) async {
     final purchaseParams = PurchaseParam(
       productDetails: productItem.productDetail,
+      // `in_app_purchase_storekit` (StoreKit 2) chuyển thẳng trường này thành
+      // `Product.PurchaseOption.appAccountToken`.
+      applicationUserName: appAccountToken,
     );
     await InAppPurchase.instance.buyNonConsumable(purchaseParam: purchaseParams);
   }
